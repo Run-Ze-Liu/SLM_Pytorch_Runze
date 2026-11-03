@@ -1,0 +1,8 @@
+{
+  "name": "tem01_11x11",
+  "description": "TEM01 test preset: 0.12 relative local threshold gives about 50 pixels per lobe for the current isolated-mode grid/waist.",
+  "mode": "tem01",
+  "array_shape": [11, 11],
+  "repeats": 1,
+  "patch_threshold": 0.12
+}

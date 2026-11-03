@@ -1,0 +1,4 @@
+{
+  "name": "tem00_11x11", "mode": "tem00", "array_shape": [11, 11],
+  "description": "TEM00，使用源码归一化宽度与间距；尚未校准到作者的1200微米范围。"
+}

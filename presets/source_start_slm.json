@@ -1,0 +1,4 @@
+{
+  "name": "source_start_slm", "mode": "tem01", "array_shape": [11, 11], "repeats": 20,
+  "description": "原 start_SLM 的实际配置；不代表作者确认的 TEM00 实验，默认关闭外部反馈。"
+}

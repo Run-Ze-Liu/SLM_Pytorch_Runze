@@ -1,0 +1,4 @@
+{
+  "name": "tem00_31x31", "mode": "tem00", "array_shape": [31, 31],
+  "description": "TEM00 31x31，源码间距参考，不能直接视为1200微米配置。"
+}
