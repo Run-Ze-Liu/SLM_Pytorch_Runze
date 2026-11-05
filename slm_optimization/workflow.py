@@ -9,7 +9,7 @@ from PIL import Image
 from .config import validate_config
 from .interfaces import load_corrections, validate_corrections, CorrectionData, SLMDevice
 from .optics import build_problem
-from .optimization import optimize_phase, OptimizationResult
+from .optimization_arxiv import optimize_phase, OptimizationResult
 
 
 @dataclass
@@ -45,7 +45,7 @@ def postprocess_phase(phase, config, *, corrections=None):
         hardware_phase adds steering; export_phase adds correction and region processing.
         All have hardware_shape, before global offsets or grayscale encoding; no amplitude aperture is applied.
     """
-    rows, cols = config.hardware_shape
+    rows, cols = config.hardware_shape  # note here is the shape of SLM hardware, not the earlier FFT grid
     y, x = np.array(phase.shape)//2-np.array(config.hardware_shape)//2
     cropped = np.array(phase[y:y+rows, x:x+cols], copy=True)
     yy, xx = np.indices(config.hardware_shape)
@@ -99,7 +99,7 @@ def save_run(result, run_dir, config):
         config: Actual RunConfig, including preset defaults and user overrides.
 
     Returns:
-        None; write NPY, BMP, JSON, and JSONL without rerunning optimization or metrics.
+        None; write NPY, BMP, cropped reconstruction PNGs, JSON, and JSONL.
     """
     run_dir = Path(run_dir)
     opt = result.optimization
@@ -112,6 +112,25 @@ def save_run(result, run_dir, config):
         np.save(run_dir/f'{name}.npy', array, allow_pickle=False)
     for angle, frame in result.frames.items():
         Image.fromarray(frame).save(run_dir/f'phase_mask0_{angle:g}.bmp')
+    reconstructed_crop = opt.reconstructed_field[863:1185, 1072:1472]
+    # Small computational grids can have no pixels inside this fixed image-plane crop.
+    if reconstructed_crop.size:
+        rows, cols = opt.reconstructed_field.shape
+        height, width = reconstructed_crop.shape
+        # Correct the display aspect using the FFT grid dimensions.
+        display_size = (width, max(1, round(height*cols/rows)))
+        intensity = np.abs(reconstructed_crop)**2
+        peak = intensity.max()
+        # Linear grayscale uses the crop peak; the NPY field retains the full precision.
+        intensity_display = intensity/peak if peak > 0 else intensity
+        # Nearest-neighbor display resizing preserves sampled values and phase colors.
+        Image.fromarray(np.rint(intensity_display*255).astype(np.uint8)).resize(
+            display_size, Image.Resampling.NEAREST).save(run_dir/'reconstructed_intensity.png')
+        # Map [-pi, pi] to a cyclic hue so the phase wrap has matching colors.
+        hue = np.rint((np.angle(reconstructed_crop)+np.pi)/(2*np.pi)*255).astype(np.uint8)
+        phase_display = np.stack((hue, np.full_like(hue, 255), np.full_like(hue, 255)), axis=-1)
+        Image.frombytes('HSV', (hue.shape[1], hue.shape[0]), phase_display.tobytes()).convert('RGB').resize(
+            display_size, Image.Resampling.NEAREST).save(run_dir/'reconstructed_phase.png')
     metadata = {'steps': opt.steps, 'phase_iteration': opt.steps,
                 'reported_field_iteration': opt.steps-1, 'seed': opt.seed_metadata,
                 'mask_geometry': 'physical_circle_original_major_axis',
@@ -189,5 +208,5 @@ def run_batch(configs, *, output_root, repeats, observer=None):
             results.append(RunSummary(result.run_dir, result.optimization.steps, cfg.seed,
                                       result.optimization.metrics))
             del result
-    # Return lightweight batch summaries to avoid retaining 20 full-size targets and fields.
+    # Return simpler batch summaries to avoid retaining 20 full-size targets and fields.
     return results
