@@ -3,38 +3,34 @@ from dataclasses import dataclass
 import hashlib
 import numpy as np
 import torch
-import torch.nn.functional as F
 from .optics import propagate_ortho
 
 
 @dataclass
 class OptimizationResult:
     """Final phase and fields from two update stages, each stored as an independent NumPy array."""
-    phase: np.ndarray
-    initial_phase: np.ndarray
-    reported_field: np.ndarray
-    reconstructed_field: np.ndarray
-    steps: int
-    history: list[dict]
-    seed_metadata: dict
-    metrics: dict
+    phase: np.ndarray  # SLM phase after the last Adam update on the FFT grid (rad).
+    initial_phase: np.ndarray  # Starting SLM phase (rad).
+    reported_field: np.ndarray  # Complex image-plane field before the last update.
+    reconstructed_field: np.ndarray  # Complex image-plane field propagated from the final phase.
+    steps: int  # Number of completed Adam updates.
+    history: list[dict]  # Recorded step numbers and loss values.
+    seed_metadata: dict  # Initialization source, sampled parameters if available, and phase checksum.
+    metrics: dict  # Fidelity and efficiency for the reported and reconstructed fields.
 
 
 @dataclass
 class _TensorProblem:
-    """Torch constants and sampling indices uploaded once, distinct from the CPU optical data record."""
-    amplitude: torch.Tensor
-    target_amplitude: torch.Tensor
-    target_phase: torch.Tensor
-    compensation: torch.Tensor
-    masks: dict
-    grid: torch.Tensor
+    """Fixed tensors and sampling indices used by the optimizer on its device."""
+    amplitude: torch.Tensor  # Fixed incident amplitude on the FFT grid.
     patch_y: torch.Tensor  # (L,), row indices of all local selected pixels.
     patch_x: torch.Tensor  # (L,), column indices paired elementwise with the row indices.
     patch_lengths: torch.Tensor  # (K,), contiguous group lengths summing to L.
     patch_weight: torch.Tensor  # (L,), fixed ion-region weights.
     patch_count: torch.Tensor  # (K,), group weight sums clamped to at least 1 for division.
-    sampled_amplitude: torch.Tensor
+    overlap: tuple[torch.Tensor, torch.Tensor, torch.Tensor]  # Rows, columns, and nonzero smooth weights.
+    sample_pixel: tuple[torch.Tensor, torch.Tensor, torch.Tensor]  # (K, 16) rows, columns, and bicubic weights.
+    cache: dict[str, torch.Tensor]  # Target samples, overlap constants, and local curvature.
 
 
 def make_initial_phase(problem, config, *, rng):
@@ -79,35 +75,12 @@ def make_initial_phase(problem, config, *, rng):
     return phase, meta
 
 
-def _sample(field: torch.Tensor, grid: torch.Tensor, *,
-            phase_reference: torch.Tensor | None = None) -> torch.Tensor:
-    """Bilinearly sample scalar maps, computing pixelwise circular errors in phase mode.
-
-    Args:
-        field: Real Torch tensor (rows, cols). Ordinary mode accepts amplitude,
-            intensity, or other scalar maps; phase_reference selects output phase in radians.
-        grid: Torch tensor (1, 1, N, 2), with normalized (x, y) coordinates in [-1, 1];
-            dtype and device must match field.
-        phase_reference: Optional target phase of matching shape, dtype, and device, in radians.
-            Samples 1-cos(field-phase_reference), rather than interpolating phase angles.
-
-    Returns:
-        N samples or circular errors, preserving zeros, align_corners=True, and gradients.
-    """
-    if phase_reference is not None:
-        if phase_reference.shape != field.shape:
-            raise ValueError('phase_reference must match field shape')
-        field = 1-torch.cos(field-phase_reference)
-    return F.grid_sample(field[None, None], grid, mode='bilinear',
-                         padding_mode='zeros', align_corners=True).reshape(-1)
-
-
 def _patch_indices(problem, sampled_intensity, threshold):
     """Build unpadded grouped pixel indices using nearest-sample assignment and intensity.
 
     Args:
         problem: CPU OpticalProblem; spots are pixel (row, col), and ion holds region weights.
-        sampled_intensity: K target intensities sampled directly by bilinear interpolation.
+        sampled_intensity: K reference intensities obtained by squaring the bicubic target amplitude samples.
         threshold: Relative intensity threshold from config.patch_threshold.
 
     Returns:
@@ -123,18 +96,18 @@ def _patch_indices(problem, sampled_intensity, threshold):
         raise ValueError('all target sampling intensities are zero')
     y, x = np.nonzero((power > threshold*sampled_intensity[active].min()) &
                       (abs(problem.masks['ion']) > 0))
-    centers = np.asarray(problem.spots)/np.array(power.shape)
+    centers = np.asarray(problem.spots)/np.array(power.shape) #normalize
     owners = np.empty(len(y), dtype=np.int64)
     # Chunk distances to avoid a full-image-pixels * K tensor; execute only once in _prepare.
     for begin in range(0, len(y), 2048):
         end = begin+2048
-        distance = (y[begin:end, None]/power.shape[0]-centers[None, :, 0])**2
+        distance = (y[begin:end, None]/power.shape[0]-centers[None, :, 0])**2 #
         distance += (x[begin:end, None]/power.shape[1]-centers[None, :, 1])**2
         distance[:, ~active] = np.inf
-        owners[begin:end] = distance.argmin(axis=1)
-    keep = power[y, x] > threshold*sampled_intensity[owners]
-    y, x, owners = y[keep], x[keep], owners[keep]
-    order = np.argsort(owners, kind='stable')
+        owners[begin:end] = distance.argmin(axis=1) # select the closest center for every power pixel
+    keep = power[y, x] > threshold*sampled_intensity[owners] 
+    y, x, owners = y[keep], x[keep], owners[keep] # mask by owner's intensity 
+    order = np.argsort(owners, kind='stable') #sort by owner index
     return y[order], x[order], np.bincount(owners, minlength=count)
 
 
@@ -146,8 +119,8 @@ def _prepare(problem, config):
         config: Matching RunConfig defining device, dtype, and relative intensity threshold.
 
     Returns:
-        _TensorProblem with fixed Torch tensors, normalized (x, y) sampling grid,
-        unpadded intensity-selected pixel indices, group counts, weights, and sampled target amplitudes.
+        _TensorProblem with pixel-space bicubic neighbors, grouped local indices,
+        and cached target and curvature values on the matching support.
     """
     device = config.device
     if device == 'auto':
@@ -156,22 +129,50 @@ def _prepare(problem, config):
     a = torch.tensor(problem.amplitude, dtype=dtype, device=device)
     ta = torch.tensor(abs(problem.target), dtype=dtype, device=device)
     tp = torch.tensor(np.angle(problem.target), dtype=dtype, device=device)
-    compensation = torch.tensor(problem.compensation, dtype=dtype, device=device)
-    masks = {k: torch.tensor(v, dtype=dtype, device=device) for k, v in problem.masks.items()}
     spots = torch.tensor(problem.spots, dtype=torch.float64, device=device)
-    grid = spots.to(dtype).clone()
-    grid[:, 0] = grid[:, 0]/(a.shape[0]-1)*2-1
-    grid[:, 1] = grid[:, 1]/(a.shape[1]-1)*2-1      #move the original point in the center to align _sample()
-    grid = grid[None, None].flip(-1)        #->(1,1,M,2) and the coordinate convert from (y,x)(see optics.py (rows,cols))) to (x,y)
-    sampled_intensity = _sample(ta.square(), grid).cpu().numpy()
-    py, px, lengths = _patch_indices(problem, sampled_intensity, config.patch_threshold)
+    # Build the 4-by-4 bicubic support directly from pixel coordinates.
+    rows, cols = a.shape
+    y, x = spots.to(dtype).clone().unbind(dim=1)
+    offsets = torch.arange(-1, 3, device=device)
+    neighbor_x = x.floor().long()[:, None] + offsets # (M,4)
+    neighbor_y = y.floor().long()[:, None] + offsets # (M,4)
+    distance = torch.stack(((x[:, None]-neighbor_x).abs(),(y[:, None]-neighbor_y).abs()))
+    alpha = -.75 # Match PyTorch's cubic convolution coefficient.
+    inner = ((alpha+2)*distance-(alpha+3))*distance.square()+1
+    outer = ((alpha*distance-5*alpha)*distance+8*alpha)*distance-4*alpha
+    wx, wy = torch.where(distance <= 1, inner, outer).unbind()
+    sample_x = neighbor_x[:, None, :].expand(-1, 4, -1).reshape(-1, 16) # (M,4)->(M,4,4)->(M,16) index like [[0,1,2,3,0,1,2,3,...],...]
+    sample_y = neighbor_y[:, :, None].expand(-1, -1, 4).reshape(-1, 16) # (M,4)->(M,4,4)->(M,16) index like [[0,0,0,0,1,1,1,1,...],...]
+    sample_weight = (wy[:, :, None]*wx[:, None, :]).reshape(-1, 16) # here the indices match sample_x and sample_y
+    valid = (sample_y >= 0) & (sample_y < rows) & (sample_x >= 0) & (sample_x < cols)
+    sample_pixel = (sample_y.clamp(0, rows-1), sample_x.clamp(0, cols-1),
+                    sample_weight.masked_fill(~valid, 0)) # Give out-of-bounds neighbors zero weight.
+    # build the unmasked indices to simplify overlap loss consumption
+    smooth = torch.tensor(problem.masks['smooth'], dtype=dtype, device=device)
+    overlap_y, overlap_x = torch.nonzero(smooth, as_tuple=True)
+    overlap = (overlap_y, overlap_x, smooth[overlap_y, overlap_x])
+    sy, sx, sw = sample_pixel
+    sampled_amplitude = (ta[sy, sx]*sw).sum(dim=1)
+    # Square the interpolated amplitude for each spot's local intensity threshold.
+    py, px, lengths = _patch_indices(problem, sampled_amplitude.square().cpu().numpy(),
+                                     config.patch_threshold)
     py = torch.tensor(py, dtype=torch.long, device=device)
     px = torch.tensor(px, dtype=torch.long, device=device)
     lengths = torch.tensor(lengths, dtype=torch.long, device=device)
-    weight = abs(masks['ion'][py, px])
-    count = torch.segment_reduce(weight, 'sum', lengths=lengths).clamp_min(1)
-    return _TensorProblem(a, ta, tp, compensation, masks, grid, py, px, lengths, weight, count,
-                          _sample(ta/ta.max(), grid))
+    ion = torch.tensor(problem.masks['ion'], dtype=dtype, device=device)
+    weight = abs(ion[py, px])
+    count = torch.segment_reduce(weight, 'sum', lengths=lengths).clamp_min(1)  # Floor each group's denominator at one.
+
+    target = ta[overlap_y, overlap_x]*torch.exp(1j*tp[overlap_y, overlap_x])*overlap[2]
+    compensation = torch.tensor(problem.compensation, dtype=dtype, device=device)
+    cache = {
+        'overlap_target_conj': target.conj().resolve_conj(),  # Weighted target on smooth support.
+        'overlap_target_norm': torch.sqrt(torch.sum(abs(target)**2)),
+        'sampled_target_amplitude': sampled_amplitude,  # (K,), one value per spot.
+        'sample_target_phase': tp[sy, sx],  # (K, 16), phase at each bicubic neighbor.
+        'patch_compensation': compensation[py, px],  # (L,), aligned with local indices.
+    }
+    return _TensorProblem(a, py, px, lengths, weight, count, overlap, sample_pixel, cache)
 
 
 def _forward(amplitude, phase):
@@ -194,8 +195,8 @@ def compute_loss(field, problem, *, step, config):
 
     Args:
         field: Complex image-plane amplitude from _forward, not an intensity map.
-        problem: _TensorProblem from _prepare, not CPU OpticalProblem;
-            target, masks, and indices must match the field shape and device.
+        problem: _TensorProblem from _prepare with cached target values and indices
+            matching the field shape and device.
         step: Zero-based iteration index selecting the early or late loss stage.
         config: RunConfig; first_round determines the stage transition.
 
@@ -203,26 +204,30 @@ def compute_loss(field, problem, *, step, config):
         Dictionary of total/overlap/amplitude/phase/local differentiable Torch scalars.
         The four individual terms exclude their stage weights.
     """
-    amplitude = abs(field)
-    amplitude = amplitude/(amplitude.max()+1e-18)
-    phase = torch.angle(field)
     # fidelity to target image by mask
-    out = amplitude*torch.exp(1j*phase)*problem.masks['smooth']
-    target = problem.target_amplitude*torch.exp(1j*problem.target_phase)*problem.masks['smooth']
-    num = torch.sum(torch.conj(target)*out)
-    den = torch.sqrt(torch.sum(abs(out)**2))*torch.sqrt(torch.sum(abs(target)**2))
+    oy, ox, ow = problem.overlap
+    ofield = field[oy, ox]
+    oamplitude = abs(ofield)
+    scale = oamplitude.max() + 1e-18
+    out = oamplitude*torch.exp(1j*torch.angle(ofield)) * ow / scale
+    num = torch.sum(problem.cache['overlap_target_conj']*out)
+    den = torch.sqrt(torch.sum(abs(out)**2)) * problem.cache['overlap_target_norm']
     overlap = 100*(1-torch.real(num/(den+1e-12))) #1e-12 is to stablize the loss where target intensity is very low
     # beam sampled amplitude penalty
-    sampled = _sample(amplitude, problem.grid)
-    expected = problem.sampled_amplitude
+    sy, sx, sw = problem.sample_pixel
+    sfield = field[sy, sx]  # (K, 16), aligned with bicubic weights and target phases.
+    sampled = (abs(sfield)*sw).sum(dim=1) / scale
+    expected = problem.cache['sampled_target_amplitude']
     amp_loss = torch.mean((sampled/(sampled.mean()+1e-12)-expected/(expected.mean()+1e-12))**2) #1e-12 also for stablizing
     # Target phase already includes design curvature; pixelwise subtraction cancels the common curvature.
     # Apply cosine before interpolation so 2*pi branch jumps cannot create spurious fractional phase offsets.
-    phase_loss = _sample(phase, problem.grid, phase_reference=problem.target_phase).mean()
+    phase_error = 1-torch.cos(torch.angle(sfield)-problem.cache['sample_target_phase'])
+    phase_loss = (phase_error * sw).sum(dim=1).mean()
     # local phase nonuniformity loss
-    patch = torch.remainder(phase[problem.patch_y, problem.patch_x]-
-                                problem.compensation[problem.patch_y, problem.patch_x], 2*torch.pi)
-    sine = torch.segment_reduce(torch.sin(patch)*problem.patch_weight, 'sum', lengths=problem.patch_lengths)
+    patch = torch.remainder(torch.angle(field[problem.patch_y, problem.patch_x])-
+                                problem.cache['patch_compensation'], 2*torch.pi)
+    sine = torch.segment_reduce(torch.sin(patch)*problem.patch_weight, 
+                                'sum', lengths=problem.patch_lengths)  # (L,)->(K,) sum the result of each target based on patch_length
     cosine = torch.segment_reduce(torch.cos(patch)*problem.patch_weight, 'sum', lengths=problem.patch_lengths)
     resultant = (torch.hypot(sine, cosine)/problem.patch_count).clamp(1e-7, 1.-1e-7)
     local_loss = torch.sqrt(-2*torch.log(resultant)+1e-7).mean()
@@ -276,6 +281,12 @@ def optimize_phase(problem, config, *, initial_phase=None, observer=None):
         that update; reconstructed_field is propagated again from final phase.
         Arrays are CPU NumPy; history and both sets of metrics are recorded separately.
     """
+    return _optimize_phase(problem, config, initial_phase=initial_phase, observer=observer,
+                           prepare=_prepare, loss_fn=compute_loss)
+
+
+def _optimize_phase(problem, config, *, initial_phase, observer, prepare, loss_fn):
+    """Run the shared Adam loop with a preparation function and loss implementation."""
     if initial_phase is None:
         initial_phase, meta = make_initial_phase(problem, config, rng=np.random.default_rng(config.seed))
     else:
@@ -284,7 +295,7 @@ def optimize_phase(problem, config, *, initial_phase=None, observer=None):
     if initial_phase.shape != problem.amplitude.shape or not np.all(np.isfinite(initial_phase)):
         raise ValueError('initial_phase must be finite and match FFT shape')
     meta['phase_sha256'] = hashlib.sha256(initial_phase.tobytes()).hexdigest()
-    data = _prepare(problem, config)
+    data = prepare(problem, config)
     phase = torch.tensor(initial_phase, device=data.amplitude.device,
                          dtype=data.amplitude.dtype, requires_grad=True)
     optimizer = torch.optim.Adam([phase], lr=config.learning_rate)
@@ -293,7 +304,7 @@ def optimize_phase(problem, config, *, initial_phase=None, observer=None):
     for step in range(min(config.max_steps, config.patience)):
         optimizer.zero_grad()
         field = _forward(data.amplitude, phase)
-        losses = compute_loss(field, data, step=step, config=config)
+        losses = loss_fn(field, data, step=step, config=config)
         if not torch.isfinite(losses['total']):
             raise FloatingPointError('non-finite optimization loss')
         losses['total'].backward()
